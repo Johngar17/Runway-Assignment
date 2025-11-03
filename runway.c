@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <assert.h>
 #include <time.h>
+#include <stdbool.h>
 
 /*** Constants that define parameters of the simulation ***/
 
@@ -46,6 +47,16 @@
 
 /* TODO */
 /* Add your synchronization variables here */
+pthread_mutex_t mutex;
+
+//Coniditional to see if ATC is on break
+pthread_cond_t ATC_break;
+
+//Conditional variable that signals if airplane leaves runway
+pthread_cond_t plane_out;
+
+//Conditional variable that signals if emergency airplane enter queue  
+pthread_cond_t Eplane_in;
 
 /* basic information about simulation.  they are printed/checked at the end 
  * and in assert statements during execution.
@@ -61,6 +72,11 @@ static int emergency_on_runway = 0;      /* Total number of emergency aircraft o
 static int aircraft_since_break = 0;     /* Aircraft processed since last controller break */
 static int current_direction = NORTH;    /* Current runway direction (NORTH or SOUTH) */
 static int consecutive_direction = 0;    /* Consecutive aircraft in current direction */
+static int nonactive_atc;                //if ATC is on break
+static int wait_cargo;                   //cargo planes waiting for clearance 
+static int wait_commerical;              //commerical planes waiting for clearance
+static int wait_emergency;               //emergency planes waiting for clearance 
+static int planes_after_break = 0;       //number of planes after break
 
 
 typedef struct 
@@ -86,10 +102,16 @@ static int initialize(aircraft_info *ai, char *filename)
   aircraft_since_break  = 0;
   current_direction     = NORTH;
   consecutive_direction = 0;
+  nonactive_atc = 0;
+  wait_cargo = 0;
+  wait_commerical = 0;
+  wait_emergency = 0;
 
-  /* Initialize your synchronization variables (and 
-   * other variables you might use) here
-   */
+
+  pthread_cond_init(&ATC_break, NULL);
+  pthread_cond_init(&plane_out, NULL);
+  pthread_cond_init(&Eplane_in, NULL);
+  pthread_mutex_init(&mutex, NULL);
 
   /* seed random number generator for fuel reserves */
   srand(time(NULL));
@@ -156,6 +178,72 @@ __attribute__((unused)) static void switch_direction()
          current_direction == NORTH ? "NORTH" : "SOUTH");
 }
 
+//check if ATC is on break 
+bool no_ATC(){
+  bool flag;
+
+  if(!nonactive_atc){
+    flag = true;
+  }
+  return flag;
+}
+
+//check if cargo planes are in queue 
+bool cargo_queue(){
+  bool flag;
+
+  if(!wait_cargo){
+    flag = true;
+  }
+  return flag;
+}
+
+//check if commerical planes are in queue 
+bool commercial_queue(){
+  bool flag;
+
+  if(!wait_commerical){
+    flag = true;
+  }
+  return flag;
+}
+
+//check if emergency planes are in queue 
+bool emergency_queue(){
+  bool flag;
+  if(!wait_emergency){
+    flag = true;
+  }
+  return flag;
+}
+
+//check to see if cargo planes can enter runway
+bool cond_enter_cargo(){
+  bool flag;
+
+  if(!(wait_commerical == 0) && (commercial_queue()) && (planes_after_break < MAX_RUNWAY_CAPACITY)){
+    flag = true;
+  }
+  return flag;
+}
+
+bool cond_enter_commercial(){
+  bool flag;
+
+  if(!(wait_cargo == 0) && (cargo_queue()) && (planes_after_break < MAX_RUNWAY_CAPACITY)){
+    flag = true;
+  }
+  return flag;
+}
+
+bool cond_enter_emergency(){
+  bool flag;
+  if(!(no_ATC())){
+    flag = true;
+  }
+  return flag;
+}
+
 /* Code for the air traffic controller thread. This is fully implemented except for 
  * synchronization with the aircraft. See the comments within the function for details.
  */
@@ -169,18 +257,29 @@ void *controller_thread(void *arg)
   /* Loop while waiting for aircraft to arrive. */
   while (1) 
   {
-    /* TODO */
-    /* Add code here to handle aircraft requests, controller breaks,      */
-    /* and runway direction switches.                                     */
-    /* Currently the body of the loop is empty.  There's no communication */
-    /* between controller and aircraft, i.e. all aircraft are admitted    */
-    /* without regard for runway capacity, aircraft type, direction,      */
-    /* priorities, and whether the controller needs a break.              */
-    /* You need to add all of this.                                       */
+    //lock access to shared variables 
+    pthread_mutex_lock(&mutex);
+
+    //Condition to check if air traffic controller can take a break 
+    //take break if 8 airplane operations has been done 
+    //assume the runway must be empty in order for ATC to take break
+    //TODO check to see if the program will deadlock
+    if(no_ATC()){
+      nonactive_atc = 1;
+      pthread_cond_broadcast(&ATC_break);
+      //ATC is on break
+    }
+
+    if(aircraft_since_break >= CONTROLLER_LIMIT && aircraft_on_runway == 0){
+      take_break();
+      //ATC on break
+      pthread_cond_broadcast(&ATC_break);
+    }
     
+    pthread_mutex_unlock(&mutex);
     /* Allow thread to be cancelled */
     pthread_testcancel();
-    usleep(100000); // 100ms sleep to prevent busy waiting
+    sleep(1); // 100ms sleep to prevent busy waiting
   }
   pthread_exit(NULL);
 }
@@ -195,17 +294,38 @@ void commercial_enter(aircraft_info *arg)
   // Suppress the compiler warning
   (void)arg;
 
-  /* TODO */
+  pthread_mutex_lock(&mutex);
+
+  wait_commerical++;
+  
+  for(;;){
+    while(planes_after_break >= CONTROLLER_LIMIT || no_ATC()){
+      pthread_cond_wait(&ATC_break, &mutex);
+    }
+    while(cond_enter_commercial()){
+      pthread_cond_wait(&plane_out, &mutex);
+    }
+    if(current_direction != NORTH){
+      pthread_cond_wait(&plane_out, &mutex);
+      switch_direction();
+    }
+    if(!(planes_after_break >= CONTROLLER_LIMIT || no_ATC()) || consecutive_direction < DIRECTION_LIMIT){
+      break;
+    }
+  }
+    
   /* Request permission to use the runway. You might also want to add      */
   /* synchronization for the simulation variables below.                   */
   /* Consider: runway capacity, direction (commercial prefer NORTH),       */
-  /* controller breaks, fuel levels, emergency priorities, and fairness.   */
-  /*  YOUR CODE HERE.                                                      */ 
+  /* controller breaks, fuel levels, emergency priorities, and fairness.   */                                                 
 
   aircraft_on_runway    = aircraft_on_runway + 1;
   aircraft_since_break  = aircraft_since_break + 1;
   commercial_on_runway  = commercial_on_runway + 1;
   consecutive_direction = consecutive_direction + 1;
+  wait_commerical       = wait_commerical - 1;
+
+  pthread_mutex_unlock(&mutex);
 }
 
 /* Code executed by a cargo aircraft to enter the runway.
@@ -215,18 +335,37 @@ void commercial_enter(aircraft_info *arg)
 void cargo_enter(aircraft_info *ai) 
 {
   (void)ai;
+  pthread_mutex_lock(&mutex);
 
-  /* TODO */
+  wait_cargo++;
+  for(;;){
+
+    while(planes_after_break >= CONTROLLER_LIMIT || no_ATC()){
+      pthread_cond_wait(&ATC_break, &mutex);
+    }
+
+    if(current_direction != SOUTH){
+      pthread_cond_wait(&plane_out, &mutex);
+      switch_direction();
+    }
+        if(!(planes_after_break >= CONTROLLER_LIMIT || no_ATC()) || consecutive_direction < DIRECTION_LIMIT){
+      break;
+    }
+
+  }
+
   /* Request permission to use the runway. You might also want to add      */
   /* synchronization for the simulation variables below.                   */
   /* Consider: runway capacity, direction (cargo prefer SOUTH),            */
   /* controller breaks, fuel levels, emergency priorities, and fairness.   */
-  /*  YOUR CODE HERE.                                                      */ 
 
   aircraft_on_runway    = aircraft_on_runway + 1;
   aircraft_since_break  = aircraft_since_break + 1;
   cargo_on_runway       = cargo_on_runway + 1;
   consecutive_direction = consecutive_direction + 1;
+  wait_cargo            = wait_cargo - 1;
+
+  pthread_mutex_unlock(&mutex);
 }
 
 /* Code executed by an emergency aircraft to enter the runway.
@@ -236,8 +375,19 @@ void cargo_enter(aircraft_info *ai)
 void emergency_enter(aircraft_info *ai) 
 {
   (void)ai;
+  pthread_mutex_lock(&mutex);
 
-  /* TODO */
+  wait_emergency++;
+
+  for(;;){
+    while(no_ATC()){
+      pthread_cond_wait(&ATC_break, &mutex);
+    }
+    while(emergency_queue() && aircraft_on_runway <= MAX_RUNWAY_CAPACITY){
+      break;
+    }
+  }
+
   /* Request permission to use the runway. You might also want to add      */
   /* synchronization for the simulation variables below.                   */
   /* Emergency aircraft have priority and must be admitted within 30s,     */
@@ -266,13 +416,14 @@ static void use_runway(int t)
  */
 static void commercial_leave() 
 {
-  /* 
-   *  TODO
-   *  YOUR CODE HERE. 
-   */
+  pthread_mutex_lock(&mutex);
 
   aircraft_on_runway = aircraft_on_runway - 1;
   commercial_on_runway = commercial_on_runway - 1;
+
+  pthread_cond_broadcast(&plane_out);
+
+  pthread_mutex_unlock(&mutex);
 }
 
 /* Code executed by a cargo aircraft when leaving the runway.
@@ -281,13 +432,15 @@ static void commercial_leave()
  */
 static void cargo_leave() 
 {
-  /* 
-   * TODO
-   * YOUR CODE HERE. 
-   */
+  pthread_mutex_lock(&mutex);
 
   aircraft_on_runway = aircraft_on_runway - 1;
   cargo_on_runway = cargo_on_runway - 1;
+
+  pthread_cond_broadcast(&plane_out);
+
+  pthread_mutex_unlock(&mutex);
+
 }
 
 /* Code executed by an emergency aircraft when leaving the runway.
@@ -296,13 +449,14 @@ static void cargo_leave()
  */
 static void emergency_leave() 
 {
-  /* 
-   * TODO
-   * YOUR CODE HERE. 
-   */
+  pthread_mutex_lock(&mutex);
 
   aircraft_on_runway = aircraft_on_runway - 1;
   emergency_on_runway = emergency_on_runway - 1;
+
+  pthread_cond_broadcast(&plane_out);
+
+  pthread_mutex_unlock(&mutex);
 }
 
 /* Main code for commercial aircraft threads.  
@@ -549,3 +703,4 @@ int main(int nargs, char **args)
 
   return 0;
 }
+
